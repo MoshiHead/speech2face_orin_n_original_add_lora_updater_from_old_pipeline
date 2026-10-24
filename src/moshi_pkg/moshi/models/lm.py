@@ -34,6 +34,7 @@ from dataclasses import dataclass
 from functools import partial
 from os.path import splitext
 import logging
+import os
 import numpy as np
 import sys
 from typing import Optional, Union, List, Tuple, Callable, Iterator
@@ -724,9 +725,63 @@ class LMGen(StreamingModule[_LMGenState]):
 
         disable = lm_model.device.type != 'cuda'
         # disable = True # DEBUG
-        graphed_main = CUDAGraphed(lm_model.forward_codes, disable=disable)
-        graphed_embeddings = CUDAGraphed(lm_model.forward_embeddings, disable=disable)
-        graphed_depth = CUDAGraphed(self.depformer_step, disable=disable)
+        # bitsandbytes 4-bit (Linear4bit) layers dequantize on every forward and
+        # allocate their dequantization scratch inside the matmul. That dynamic
+        # allocation is not CUDA-graph-safe: a captured graph replays against the
+        # scratch addresses from capture time, so once those are reused the main
+        # transformer silently produces garbage (the model emits only PAD tokens).
+        # Detect a bnb4-quantized main transformer and run it eagerly instead.
+        # The depformer / embeddings stay bf16, so their graphs are unaffected.
+        def _has_linear4bit(module: torch.nn.Module) -> bool:
+            # Detect bitsandbytes NF4/FP4 quantization specifically -- NOT the
+            # tinygemm int4 path (Int4Linear, quant_type="int4pack"), which uses
+            # the single fused _weight_int4pack_mm kernel and IS graph-safe.
+            # bitsandbytes Linear4bit dequantizes with a dynamic scratch alloc
+            # that is NOT graph-safe. Robust to PEFT LoRA wrapping: a LoraLayer
+            # keeps the quantized module as .base_layer.
+            seen = set()
+            stack = [module]
+            while stack:
+                mod = stack.pop()
+                if id(mod) in seen:
+                    continue
+                seen.add(id(mod))
+                if type(mod).__name__ == "Linear4bit":
+                    return True
+                w = getattr(mod, "weight", None)
+                qt = getattr(w, "quant_type", None) if w is not None else None
+                if qt in ("nf4", "fp4"):
+                    return True
+                for child in mod.children():
+                    stack.append(child)
+                base = getattr(mod, "base_layer", None)
+                if isinstance(base, torch.nn.Module):
+                    stack.append(base)
+            return False
+
+        # When the main transformer is bnb4-quantized we must run it eagerly (see
+        # above). But the main, embeddings and depformer graphs share one CUDA
+        # RNG offset: the eager text sampling in process_transformer_output and
+        # the graphed depformer sampling must stay in lockstep. Running the main
+        # eagerly while leaving the depformer graphed desyncs that offset and
+        # re-triggers "Offset increment outside graph capture". So a bnb4 main
+        # forces ALL THREE graphs off -- fully eager, fully RNG-consistent.
+        disable_main = disable or _has_linear4bit(lm_model.transformer)
+        # Escape hatch: allow forcing the graphed main back on for experimentation
+        # (e.g. to test whether a given bitsandbytes/CUDA combo is graph-safe).
+        if disable_main and not disable and os.environ.get("BNB4_CUDA_GRAPH", "").lower() in {"1", "yes", "true", "on"}:
+            disable_main = False
+        eager_all = disable_main and not disable
+        if eager_all:
+            logger.info(
+                "bitsandbytes 4-bit main transformer detected: running the LM "
+                "fully eagerly (all CUDA graphs disabled) to avoid PAD-only output "
+                "and keep the sampling RNG consistent. Set BNB4_CUDA_GRAPH=1 to "
+                "force the graphs back on."
+            )
+        graphed_main = CUDAGraphed(lm_model.forward_codes, disable=disable_main)
+        graphed_embeddings = CUDAGraphed(lm_model.forward_embeddings, disable=(disable or eager_all))
+        graphed_depth = CUDAGraphed(self.depformer_step, disable=(disable or eager_all))
 
         return _LMGenState(cache, provided, initial, graphed_main, graphed_embeddings, graphed_depth)
     

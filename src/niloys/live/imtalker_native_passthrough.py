@@ -250,6 +250,18 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         self.tf_capture_layer = int(capture_layer)
         super().__init__(*args, **kwargs)
 
+        # The STT submodel must NOT capture CUDA graphs. A captured graph
+        # registers the default CUDA RNG and RESETS its offset on every
+        # replay; since _stt_step() runs immediately before lm_gen._step()
+        # on the same GPU thread, that reset desyncs the main model's
+        # graphed depformer and crashes text sampling with
+        #   RuntimeError: Offset increment outside graph capture encountered unexpectedly.
+        # The STT model is greedy (temp=0), so it neither needs nor uses RNG;
+        # running it eagerly removes the conflict at a cost of a few ms per
+        # 80ms frame. Done here (not in liveTry.py) so the base engine file
+        # stays byte-identical to the reference implementation.
+        self._disable_stt_cuda_graphs()
+
         # Forensic finding (conversation_logs_1/2/3): the old fixed 25-chunk
         # (~2.0s) filler cap was shorter than observed real-world retrieval+
         # compression latency -- compression alone was observed taking
@@ -298,6 +310,42 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
                 )
 
         self._install_graph_hidden_capture()
+
+    def _disable_stt_cuda_graphs(self) -> None:
+        """Force the STT submodel (and its Mimi) to run eagerly -- see the
+        call site in __init__ for why. Finds every CUDAGraphed instance on
+        the STT LMGen's / Mimi's streaming state and sets .disable = True,
+        which makes CUDAGraphed.__call__ run the wrapped function directly
+        instead of replaying a captured graph. Robust to the exact streaming
+        -state layout of the upstream moshi package: anything whose type is
+        named CUDAGraphed is disabled, wherever it is found."""
+        targets = []
+        for root in (getattr(self, "stt_lm_gen", None), getattr(self, "stt_mimi", None)):
+            if root is None:
+                continue
+            state = getattr(root, "_streaming_state", None)
+            for container in (root, state):
+                if container is None:
+                    continue
+                names = list(getattr(container, "__dataclass_fields__", {}) or {})
+                try:
+                    names += list(vars(container).keys())
+                except TypeError:
+                    pass
+                for name in dict.fromkeys(names):
+                    try:
+                        obj = getattr(container, name, None)
+                    except Exception:
+                        continue
+                    if type(obj).__name__ == "CUDAGraphed" and not getattr(obj, "disable", False):
+                        obj.disable = True
+                        targets.append(name)
+        if targets:
+            print(
+                f"[liveTryPlasticity][search] STT CUDA graphs disabled (eager STT; "
+                f"prevents default-RNG desync of the main graphed depformer): {targets}",
+                flush=True,
+            )
 
     def _install_graph_hidden_capture(self) -> None:
         lm_model = self.lm
