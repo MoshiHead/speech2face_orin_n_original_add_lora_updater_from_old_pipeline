@@ -65,6 +65,7 @@ class ConversationLogger:
         self.log_dir = str(log_dir or "")
         self._jsonl_path: str | None = None
         self._detail_path: str | None = None
+        self._tool_path: str | None = None
         self._lock = threading.Lock()
 
         # Running total for this server process (i.e. across the whole
@@ -131,9 +132,30 @@ class ConversationLogger:
                         + "=" * 80 + "\n\n"
                     )
 
+                # Dedicated, single-file tool-calling trace. Every tool-calling
+                # stage (STT transcript -> router decision -> search query ->
+                # search results -> LLM summary -> injected context -> spoken
+                # response), plus errors and state changes, is mirrored here in
+                # strict chronological order with millisecond timestamps, so the
+                # whole tool-calling flow can be traced from ONE file instead of
+                # correlating conversation_/detailed_/latency_ side by side.
+                self._tool_path = os.path.join(self.log_dir, f"tool_calling_{self.session_id}.log")
+                with open(self._tool_path, "a", encoding="utf-8") as f:
+                    f.write(
+                        "=" * 80 + "\n"
+                        f"Tool-calling trace -- session {self.session_id}\n"
+                        f"Started {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                        "Chronological log of every tool-calling step with millisecond\n"
+                        "timestamps: STT transcription, router (LLM) decision, web-search\n"
+                        "query, search results, LLM summary, context injected into the\n"
+                        "model, the model's spoken response, errors, stage execution times,\n"
+                        "and pipeline state changes.\n"
+                        + "=" * 80 + "\n\n"
+                    )
+
                 print(
                     f"[conversation_logger] logging conversation events to {text_path}, "
-                    f"{self._jsonl_path}, and {self._detail_path}",
+                    f"{self._jsonl_path}, {self._detail_path}, and {self._tool_path}",
                     flush=True,
                 )
 
@@ -169,6 +191,17 @@ class ConversationLogger:
         now = time.time()
         return time.strftime("%H:%M:%S", time.localtime(now)) + f".{int(now % 1 * 1000):03d}"
 
+    def _tool_write(self, text: str) -> None:
+        """Append one millisecond-timestamped line to the dedicated tool-calling
+        trace. Never raises -- logging must never break the live pipeline."""
+        if not self._tool_path:
+            return
+        try:
+            with self._lock, open(self._tool_path, "a", encoding="utf-8") as f:
+                f.write(f"[{self._now_ts()}] {text}\n")
+        except Exception as e:
+            print(f"[conversation_logger] failed to write tool-calling log: {e!r}", flush=True)
+
     def _write_detail(self, turn_id: Any, heading: str, body: list[str]) -> None:
         """Append one readable, timestamped section to the detailed
         narrative log. Never raises -- logging must never break the pipeline."""
@@ -187,6 +220,13 @@ class ConversationLogger:
                 f.write(text)
         except Exception as e:
             print(f"[conversation_logger] failed to write detailed log: {e!r}", flush=True)
+        # Mirror the narrative into the dedicated tool-calling trace (one line
+        # per body entry, keeping the turn label so it can be grepped by turn).
+        self._tool_write(f"{turn_label} — {heading}")
+        for b in body:
+            for sub in str(b).splitlines() or [""]:
+                if sub.strip():
+                    self._tool_write(f"    {sub}")
 
     # -- convenience wrappers matching the actual pipeline events (short,
     # machine-friendly console/JSONL events) --------------------------------
@@ -208,6 +248,8 @@ class ConversationLogger:
     def _turn(self, turn_id: Any, stage: str, text: str, kind: str, **fields: Any) -> None:
         self.logger.info(f"TURN {turn_id} | {stage:<{self._STAGE_W}} | {text}")
         self._write_jsonl({"kind": kind, "turn": turn_id, **fields})
+        # Mirror every pipeline stage into the dedicated tool-calling trace.
+        self._tool_write(f"TURN {turn_id} | {stage:<{self._STAGE_W}} | {text}")
 
     def turn_heard(
         self, turn_id: Any, transcript: str, token_ids: list | None = None,
@@ -380,9 +422,27 @@ class ConversationLogger:
 
     def component_status(self, **fields: Any) -> None:
         self.event("component_status", **fields)
+        # Pipeline state changes (search enabled/disabled, STT/router/compressor
+        # up or down, thinking sound on/off, ...) belong in the trace too.
+        summary = fields.pop("summary", "")
+        extra = " ".join(f"{k}={v!r}" for k, v in fields.items() if v is not None)
+        line = "STATE"
+        if summary:
+            line += f" | {summary}"
+        if extra:
+            line += f" | {extra}"
+        self._tool_write(line)
 
     def error(self, where: str, exc: BaseException, traceback_text: str = "") -> None:
         self.event("error", f"{where}: {exc!r}", where=where, traceback=traceback_text[-4000:])
+        # Errors are a first-class part of the tool-calling trace: a failed STT
+        # call, router, search, compression, or injection must be visible in the
+        # same chronological file as the stages around it.
+        self._tool_write(f"ERROR | {where}: {exc!r}")
+        if traceback_text:
+            for line in traceback_text[-2000:].splitlines():
+                if line.strip():
+                    self._tool_write(f"    {line}")
 
     # -- detailed, plain-English narrative (the new "any user can read it"
     # log) ------------------------------------------------------------------

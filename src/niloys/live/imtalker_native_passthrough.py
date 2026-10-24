@@ -4240,8 +4240,45 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                 ingestion append new PCM between steps instead of waiting behind a
                 multi-step catch-up burst.
                 """
+                # bitsandbytes 4-bit (Linear4bit) dequant kernels capture the
+                # current stream handle inside the CUDA graph at capture time.
+                # Replaying that graph on a DIFFERENT stream (this worker's
+                # high-priority stream) leaves stale stream references, which
+                # corrupts the transformer's output (PAD-only tokens) and the
+                # Mimi convs (CUDNN_STATUS_INTERNAL_ERROR), and trips the
+                # default-RNG offset check ("Offset increment outside graph
+                # capture"). The reference pipeline runs the LM on the default
+                # stream and is stable, so when the trunk is bnb4 we do the same:
+                # skip the priority stream and replay graphs on the default
+                # stream. The fused tinygemm int4 kernel is stream-safe, so the
+                # original int4 path keeps the priority stream unchanged.
+                def _lm_uses_bnb4() -> bool:
+                    try:
+                        transformer = reply_engine.lm.transformer
+                    except Exception:
+                        return False
+                    seen = set()
+                    stack = [transformer]
+                    while stack:
+                        mod = stack.pop()
+                        if id(mod) in seen:
+                            continue
+                        seen.add(id(mod))
+                        if type(mod).__name__ == "Linear4bit":
+                            return True
+                        w = getattr(mod, "weight", None)
+                        if getattr(w, "quant_type", None) in ("nf4", "fp4"):
+                            return True
+                        for child in mod.children():
+                            stack.append(child)
+                        base = getattr(mod, "base_layer", None)  # PEFT LoRA wrapper
+                        if isinstance(base, torch.nn.Module):
+                            stack.append(base)
+                    return False
+
+                bnb4_trunk = _lm_uses_bnb4()
                 priority_stream = None
-                if torch.cuda.is_available():
+                if torch.cuda.is_available() and not bnb4_trunk:
                     try:
                         # PyTorch accepts -1 as a high-priority stream even in builds
                         # that do not expose get_stream_priority_range().
@@ -4249,6 +4286,12 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                         print("[PERSONA-CONTINUOUS] high-priority CUDA stream enabled", flush=True)
                     except Exception as exc:
                         print(f"[PERSONA-CONTINUOUS] stream fallback: {exc!r}", flush=True)
+                elif bnb4_trunk:
+                    print(
+                        "[PERSONA-CONTINUOUS] bnb-4bit trunk detected: running the LM on the "
+                        "default stream (priority stream disabled) for graph-safe replay",
+                        flush=True,
+                    )
                 total_events = 0
                 native_audio_seq = 0
                 last_event_alarm_wall = 0.0
