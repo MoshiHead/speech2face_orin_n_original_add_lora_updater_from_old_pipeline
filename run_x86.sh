@@ -103,6 +103,30 @@ if [ "$ENABLE_SEARCH" = "1" ]; then
   MOSHI_WEIGHT="$PERSONAPLEX_BNB4_DIR/model_bnb_4bit.pt"
   QUANTIZE_ARGS=(--quantize_4bit)
 
+  # The <lookup>/<ref> LoRA was trained and validated in the reference
+  # pipeline's exact inference context: the RB_Robert_System_Prompt_full.txt
+  # system prompt and the official VARM3 voice prompt. A different prompt or
+  # voice shifts the model's context enough that the adapter's
+  # <ref>-consumption behavior does not activate -- the model then treats the
+  # injected <ref> block like a system prompt (the feeding path is
+  # mechanically identical) and re-opens the conversation with a greeting
+  # instead of answering from the injected data. Match the reference exactly.
+  # Override with SEARCH_PROMPT_FILE / SEARCH_VOICE if you know what you are
+  # doing; the avatar is hidden-state driven and unaffected by the voice swap.
+  SEARCH_PROMPT_FILE="${SEARCH_PROMPT_FILE:-$SRC/imtalker/prompts/RB_Robert_System_Prompt_full.txt}"
+  if [ -f "$SEARCH_PROMPT_FILE" ]; then
+    TEXT_PROMPT="$(tr '\n' ' ' < "$SEARCH_PROMPT_FILE")"
+  else
+    echo "[warn] $SEARCH_PROMPT_FILE not found -- keeping the default text prompt" >&2
+  fi
+  SEARCH_VOICE="${SEARCH_VOICE:-VARM3.pt}"
+  if [ -f "$W/voices/$SEARCH_VOICE" ]; then
+    VOICE="$SEARCH_VOICE"
+  else
+    echo "[warn] $W/voices/$SEARCH_VOICE not found -- keeping voice ${VOICE:-Robert_5.pt}" >&2
+  fi
+  echo "Search inference context: prompt=$SEARCH_PROMPT_FILE voice=${VOICE:-Robert_5.pt}"
+
   SEARCH_ARGS=(
     --conversation_log_dir "$CONVERSATION_LOG_DIR"
     --ref_lora_dir "$REF_LORA_DIR"

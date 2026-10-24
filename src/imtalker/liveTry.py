@@ -470,6 +470,16 @@ class MoshiOnlyEngine:
             return
         voice_path = self._resolve_voice_prompt_path()
         raw_voice_prompt = bool(voice_path and not voice_path.endswith(".pt"))
+        # Record the exact inference context in the tool-calling trace: the
+        # <lookup>/<ref> LoRA's behavior is conditioned on the system prompt
+        # and voice it was trained with, so a mismatch here is the first thing
+        # to check when the model ignores injected <ref> context.
+        with contextlib.suppress(Exception):
+            self.conv_logger.component_status(
+                summary="inference_context",
+                voice_prompt=str(voice_path or ""),
+                text_prompt=str(self.text_prompt or ""),
+            )
         if voice_path:
             if voice_path.endswith(".pt") and hasattr(self.lm_gen, "load_voice_prompt_embeddings"):
                 self.lm_gen.load_voice_prompt_embeddings(voice_path)

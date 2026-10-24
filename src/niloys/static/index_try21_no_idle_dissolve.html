@@ -279,6 +279,11 @@
     let micCaptureEnabled = false;
     let playbackCursor = 0, playbackStartTime = 0, serverSR = 24000, audioStarted = false;
     let mediaClockStartMs = 0, mediaClockAudioBase = 0, mediaClockCorrectionSec = 0;
+    // A/V sync: the video clock follows the worklet's PLAYED-audio clock, not
+    // the wall clock (see the frame loop). lastMediaElapsedSec makes the clock
+    // monotonic across the worklet's ~21ms stats cadence; lastAudioStatsWallMs
+    // detects a dead audio system so the wall clock can take over as a fallback.
+    let lastMediaElapsedSec = 0, lastAudioStatsWallMs = 0;
     let frameStore = new Map(), frameLoopHandle = null, frameCounter = 0, frameT0 = 0, sessionT0 = 0;
     let lastRenderedFrame = -1, highestFrameReceived = -1;
     let modelType = "—", tokensPerChunk = 0, bufferMs = 1400;
@@ -359,6 +364,8 @@
       mediaClockStartMs = 0;
       mediaClockAudioBase = 0;
       mediaClockCorrectionSec = 0;
+      lastMediaElapsedSec = 0;
+      lastAudioStatsWallMs = 0;
     }
 
     function startSharedMediaClock() {
@@ -627,6 +634,7 @@
       });
       outputWorklet.port.onmessage = (evt) => {
         const stats = evt.data || {};
+        lastAudioStatsWallMs = performance.now();
         audioStreamTime = Math.max(0, Number(stats.streamTime || 0));
         audioQueuedSamples = Math.max(0, Number(stats.queuedSamples || 0));
         assistantPlaybackActive = Boolean(stats.started) && audioQueuedSamples > 0;
@@ -662,6 +670,8 @@
       workletOverflows = 0;
       workletDroppedSamples = 0;
       decodedAudioDuration = 0;
+      lastMediaElapsedSec = 0;
+      lastAudioStatsWallMs = 0;
     }
 
     function initOpusDecoder() {
@@ -923,18 +933,24 @@
             ? Math.max(0, (performance.now() - mediaClockStartMs) / 1000)
             : 0;
           const observedAudio = Math.max(0, audioStreamTime - mediaClockAudioBase);
-          const drift = observedAudio - (wallElapsed + mediaClockCorrectionSec);
-          mediaClockCorrectionSec = Math.max(
-            -0.12,
-            Math.min(
-              0.12,
-              mediaClockCorrectionSec + Math.max(
-                -MEDIA_CLOCK_CORRECTION_PER_TICK,
-                Math.min(MEDIA_CLOCK_CORRECTION_PER_TICK, drift),
-              ),
-            ),
+          // Video follows the PLAYED-audio clock, not the wall clock. When the
+          // worklet underruns (its buffer drains during a pipeline stall, e.g.
+          // the ~0.7s blocking <ref> injection that halts audio production),
+          // the audio pauses -- and the video must pause with it, or the lips
+          // run ahead of the voice. The old wall-clock-plus-slow-drift design
+          // (0.67ms/tick, clamped to +/-120ms) could never recover from that,
+          // which is exactly the "lips move before the audio" symptom.
+          // The wall clock is only a fallback for a dead audio system (no
+          // worklet stats for >500ms); the monotonic guard stops the ~21ms
+          // stats cadence from ever stepping the clock backwards.
+          const audioStatsFresh =
+            lastAudioStatsWallMs > 0 &&
+            performance.now() - lastAudioStatsWallMs < 500;
+          mediaElapsed = Math.max(
+            lastMediaElapsedSec,
+            audioStatsFresh ? observedAudio : wallElapsed,
           );
-          mediaElapsed = Math.max(0, wallElapsed + mediaClockCorrectionSec);
+          lastMediaElapsedSec = mediaElapsed;
         } else {
           mediaElapsed = Math.max(0, audioCtx.currentTime - playbackStartTime);
         }
